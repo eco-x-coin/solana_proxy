@@ -1,0 +1,5 @@
+solana-proxy
+solana-validator-proxy
+target/
+nohup.out
+proxy.log
