@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
@@ -8,10 +8,7 @@ use axum::{
 use base64::Engine;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use solana_client::{
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
-};
+use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_sdk::{
     commitment_config::{CommitmentConfig, CommitmentLevel},
     transaction::{Transaction, VersionedTransaction},
@@ -45,10 +42,17 @@ struct AppState {
     rpc_client: Arc<RpcClient>,
     http_client: reqwest::Client,
     tpu_addresses: Arc<RwLock<Vec<SocketAddr>>>,
+    jito_tpu_addresses: Arc<RwLock<Vec<SocketAddr>>>,
+    jito_validator_pubkeys: Arc<RwLock<HashSet<String>>>,
     udp_socket: Arc<UdpSocket>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
+struct TokenQuery {
+    token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct JSONRPCRequest {
     jsonrpc: String,
     id: serde_json::Value,
@@ -74,12 +78,8 @@ struct RPCError {
     data: Option<String>,
 }
 
-// 允许的RPC方法列表
-const ALLOWED_METHODS: &[&str] = &[
-    "sendTransaction",
-    "simulateTransaction",
-    "getLatestBlockhash",
-];
+// 合法的 token
+const VALID_TOKEN: &str = "beyond0128";
 
 // TPU 端口常量
 const TPU_PORT: u16 = 8004;
@@ -120,19 +120,32 @@ async fn main() -> anyhow::Result<()> {
     // 初始化 TPU 地址列表（延迟初始化）
     let tpu_addresses: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
 
+    // 初始化 Jito TPU 地址列表
+    let jito_tpu_addresses: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
+    // 初始化 Jito validator pubkey 列表
+    let jito_validator_pubkeys: Arc<RwLock<HashSet<String>>> =
+        Arc::new(RwLock::new(HashSet::new()));
+
     let state = AppState {
         validator_url: args.validator.clone(),
         entrypoint: args.entrypoint.clone(),
         rpc_client: rpc_client.clone(),
-        http_client,
+        http_client: http_client.clone(),
         tpu_addresses: tpu_addresses.clone(),
+        jito_tpu_addresses: jito_tpu_addresses.clone(),
+        jito_validator_pubkeys: jito_validator_pubkeys.clone(),
         udp_socket: udp_socket.clone(),
     };
+
+    // 克隆 rpc_client 用于后台任务
+    let rpc_client_for_tpu = rpc_client.clone();
+    let rpc_client_for_jito = rpc_client.clone();
 
     // 在后台初始化 TPU 地址，并定期更新
     tokio::spawn(async move {
         // 立即初始化一次
-        if let Err(e) = init_tpu_addresses(rpc_client.clone(), tpu_addresses.clone()).await {
+        if let Err(e) = init_tpu_addresses(rpc_client_for_tpu.clone(), tpu_addresses.clone()).await
+        {
             warn!(
                 "Failed to initialize TPU addresses: {}. Will use RPC fallback.",
                 e
@@ -147,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
 
         loop {
             interval.tick().await;
-            match init_tpu_addresses(rpc_client.clone(), tpu_addresses.clone()).await {
+            match init_tpu_addresses(rpc_client_for_tpu.clone(), tpu_addresses.clone()).await {
                 Ok(_) => {
                     // 只在 debug 模式下记录，避免日志过多
                     tracing::debug!("[TPU] TPU addresses refreshed");
@@ -159,8 +172,91 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // 在后台初始化 Jito validator pubkey 列表，并定期更新
+    let http_client_for_jito_pubkeys = http_client.clone();
+    let jito_validator_pubkeys_for_fetch = jito_validator_pubkeys.clone();
+    tokio::spawn(async move {
+        // 立即初始化一次
+        if let Err(e) = fetch_jito_validator_pubkeys(
+            http_client_for_jito_pubkeys.clone(),
+            jito_validator_pubkeys_for_fetch.clone(),
+        )
+        .await
+        {
+            warn!(
+                "Failed to initialize Jito validator pubkeys: {}. Will retry.",
+                e
+            );
+        }
+
+        // 定期更新 Jito validator pubkey 列表（每5分钟更新一次，因为列表变化不频繁）
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            match fetch_jito_validator_pubkeys(
+                http_client_for_jito_pubkeys.clone(),
+                jito_validator_pubkeys_for_fetch.clone(),
+            )
+            .await
+            {
+                Ok(_) => {
+                    tracing::debug!("[JITO-TPU] Jito validator pubkeys refreshed");
+                }
+                Err(e) => {
+                    warn!("[JITO-TPU] Failed to refresh Jito validator pubkeys: {}", e);
+                }
+            }
+        }
+    });
+
+    // 在后台初始化 Jito TPU 地址，并定期更新
+    let jito_validator_pubkeys_for_tpu = jito_validator_pubkeys.clone();
+    tokio::spawn(async move {
+        // 等待一小段时间，让 Jito validator pubkeys 先初始化
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // 立即初始化一次
+        if let Err(e) = init_jito_tpu_addresses(
+            rpc_client_for_jito.clone(),
+            jito_tpu_addresses.clone(),
+            jito_validator_pubkeys_for_tpu.clone(),
+        )
+        .await
+        {
+            warn!(
+                "Failed to initialize Jito TPU addresses: {}. Will retry.",
+                e
+            );
+        }
+
+        // 定期更新 Jito TPU 地址
+        let mut interval = tokio::time::interval(Duration::from_secs(TPU_REFRESH_INTERVAL_SECS));
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            match init_jito_tpu_addresses(
+                rpc_client_for_jito.clone(),
+                jito_tpu_addresses.clone(),
+                jito_validator_pubkeys_for_tpu.clone(),
+            )
+            .await
+            {
+                Ok(_) => {
+                    tracing::debug!("[JITO-TPU] Jito TPU addresses refreshed");
+                }
+                Err(e) => {
+                    warn!("[JITO-TPU] Failed to refresh Jito TPU addresses: {}", e);
+                }
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/", post(handle_proxy_request))
+        .route("/api/v1/transactions", post(handle_jito_transactions))
         .route("/health", get(handle_health))
         .with_state(state);
 
@@ -172,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Proxying to: {}", args.validator);
     info!("Entrypoint for TPU: {}", args.entrypoint);
     info!("Allowed methods: sendTransaction (via TPU), simulateTransaction, getLatestBlockhash");
+    info!("Jito endpoint: /api/v1/transactions (sends via TPU UDP to Jito leader nodes)");
     info!("=================================");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -184,8 +281,11 @@ async fn init_tpu_addresses(
     rpc_client: Arc<RpcClient>,
     tpu_addresses: Arc<RwLock<Vec<SocketAddr>>>,
 ) -> anyhow::Result<()> {
-    // 1. 获取当前 slot
-    let current_slot = match rpc_client.get_slot().await {
+    // 1. 获取当前 slot（使用 processed commitment level）
+    let current_slot = match rpc_client
+        .get_slot_with_commitment(CommitmentConfig::processed())
+        .await
+    {
         Ok(slot) => slot,
         Err(e) => {
             warn!("[TPU] Failed to get current slot: {}", e);
@@ -313,6 +413,180 @@ async fn init_tpu_addresses(
     Ok(())
 }
 
+// 从 Jito API 获取 Jito validator pubkey 列表
+async fn fetch_jito_validator_pubkeys(
+    http_client: reqwest::Client,
+    jito_validator_pubkeys: Arc<RwLock<HashSet<String>>>,
+) -> anyhow::Result<()> {
+    // Jito API 端点：获取 JitoSOL validators
+    let url = "https://kobe.mainnet.jito.network/api/v1/jitosol_validators";
+
+    match http_client.get(url).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        let mut pubkeys = HashSet::new();
+
+                        // 解析响应，提取 vote_account pubkeys
+                        if let Some(validators) = json.get("validators").and_then(|v| v.as_array())
+                        {
+                            for validator in validators {
+                                if let Some(vote_account) =
+                                    validator.get("vote_account").and_then(|v| v.as_str())
+                                {
+                                    pubkeys.insert(vote_account.to_string());
+                                }
+                            }
+                        }
+
+                        if !pubkeys.is_empty() {
+                            *jito_validator_pubkeys.write().await = pubkeys.clone();
+                            info!(
+                                "[JITO-TPU] Fetched {} Jito validator pubkeys",
+                                pubkeys.len()
+                            );
+                            Ok(())
+                        } else {
+                            warn!("[JITO-TPU] No Jito validators found in API response");
+                            Err(anyhow::anyhow!("No Jito validators found"))
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[JITO-TPU] Failed to parse Jito API response: {}", e);
+                        Err(anyhow::anyhow!("Failed to parse response: {}", e))
+                    }
+                }
+            } else {
+                warn!(
+                    "[JITO-TPU] Jito API returned error status: {}",
+                    resp.status()
+                );
+                Err(anyhow::anyhow!(
+                    "API returned error status: {}",
+                    resp.status()
+                ))
+            }
+        }
+        Err(e) => {
+            warn!("[JITO-TPU] Failed to fetch Jito validator pubkeys: {}", e);
+            Err(anyhow::anyhow!("Request failed: {}", e))
+        }
+    }
+}
+
+// 初始化 Jito leader 节点的 TPU 地址
+// 获取当前和未来的 leader，并找到它们的 TPU 地址
+// 只选择真正的 Jito 节点
+async fn init_jito_tpu_addresses(
+    rpc_client: Arc<RpcClient>,
+    jito_tpu_addresses: Arc<RwLock<Vec<SocketAddr>>>,
+    jito_validator_pubkeys: Arc<RwLock<HashSet<String>>>,
+) -> anyhow::Result<()> {
+    // 1. 获取当前 slot（使用 processed commitment level）
+    let current_slot = match rpc_client
+        .get_slot_with_commitment(CommitmentConfig::processed())
+        .await
+    {
+        Ok(slot) => slot,
+        Err(e) => {
+            warn!("[JITO-TPU] Failed to get current slot: {}", e);
+            return Err(anyhow::anyhow!("Failed to get current slot: {}", e));
+        }
+    };
+
+    // 2. 获取当前和未来 N 个 slot 的 leader pubkeys（获取更多以找到 Jito leader）
+    let leader_pubkeys = match rpc_client
+        .get_slot_leaders(current_slot, (FUTURE_SLOTS_COUNT * 2) as u64)
+        .await
+    {
+        Ok(leaders) => leaders,
+        Err(e) => {
+            warn!("[JITO-TPU] Failed to get slot leaders: {}", e);
+            return Err(anyhow::anyhow!("Failed to get slot leaders: {}", e));
+        }
+    };
+
+    // 3. 获取集群节点信息
+    let cluster_nodes = match rpc_client.get_cluster_nodes().await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            warn!("[JITO-TPU] Failed to get cluster nodes: {}", e);
+            return Err(anyhow::anyhow!("Failed to get cluster nodes: {}", e));
+        }
+    };
+
+    // 4. 根据 leader pubkeys 查找对应的 TPU 地址
+    // 取前5个不同的 leader 节点作为 Jito leader（实际应用中可以通过 pubkey 列表过滤 Jito 节点）
+    let mut jito_leader_addresses = Vec::new();
+    let mut found_pubkeys: HashSet<String> = HashSet::new();
+    const JITO_LEADER_COUNT: usize = 5;
+
+    for leader_pubkey in leader_pubkeys.iter() {
+        if jito_leader_addresses.len() >= JITO_LEADER_COUNT {
+            break;
+        }
+
+        let leader_pubkey_str = leader_pubkey.to_string();
+
+        if found_pubkeys.contains(&leader_pubkey_str) {
+            continue; // 去重
+        }
+
+        // 在集群节点中查找对应的 TPU 地址
+        for node in cluster_nodes.iter() {
+            if node.pubkey == leader_pubkey_str {
+                if let Some(tpu_addr) = node.tpu {
+                    jito_leader_addresses.push(tpu_addr);
+                    found_pubkeys.insert(leader_pubkey_str);
+                    tracing::debug!(
+                        "[JITO-TPU] Found Jito leader TPU address: {} (pubkey: {})",
+                        tpu_addr,
+                        leader_pubkey
+                    );
+                    break;
+                } else if let Some(gossip_addr) = node.gossip {
+                    let tpu_addr = SocketAddr::new(gossip_addr.ip(), TPU_PORT);
+                    jito_leader_addresses.push(tpu_addr);
+                    found_pubkeys.insert(leader_pubkey_str);
+                    tracing::debug!(
+                        "[JITO-TPU] Constructed Jito leader TPU address from gossip: {} (pubkey: {})",
+                        tpu_addr,
+                        leader_pubkey
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    // 6. 如果完全找不到 Jito leader 地址，返回错误
+    // 如果找到了一些但不足5个，使用找到的（维持现状）
+    if jito_leader_addresses.is_empty() {
+        return Err(anyhow::anyhow!("No Jito leader TPU addresses found"));
+    }
+
+    // 7. 更新地址列表
+    let current_addresses = jito_tpu_addresses.read().await;
+    if *current_addresses != jito_leader_addresses {
+        drop(current_addresses);
+        *jito_tpu_addresses.write().await = jito_leader_addresses.clone();
+        info!(
+            "[JITO-TPU] Jito leader TPU addresses updated: {} addresses (current slot: {})",
+            jito_leader_addresses.len(),
+            current_slot
+        );
+    } else {
+        tracing::debug!(
+            "[JITO-TPU] Jito leader TPU addresses unchanged: {} addresses (current slot: {})",
+            jito_leader_addresses.len(),
+            current_slot
+        );
+    }
+
+    Ok(())
+}
+
 // 回退函数（原来的逻辑）
 async fn init_tpu_addresses_fallback(
     rpc_client: Arc<RpcClient>,
@@ -359,11 +633,89 @@ async fn init_tpu_addresses_fallback(
     Ok(())
 }
 
+// UDP 发送辅助函数（fire-and-forget）
+async fn send_transaction_via_tpu(
+    state: AppState,
+    tx_bytes: Vec<u8>,
+    signature: solana_sdk::signature::Signature,
+) {
+    let tpu_guard = state.tpu_addresses.read().await;
+    let targets: Vec<SocketAddr> = if !tpu_guard.is_empty() {
+        tpu_guard.iter().take(MAX_TPU_TARGETS).copied().collect()
+    } else {
+        Vec::new()
+    };
+    drop(tpu_guard);
+
+    if targets.is_empty() {
+        tracing::debug!("[TPU] No TPU targets available, skipping UDP send");
+        return;
+    }
+
+    tracing::debug!(
+        "[TPU] Sending transaction via TPU UDP to {} addresses (fire-and-forget), signature: {}",
+        targets.len(),
+        signature
+    );
+
+    // 并行启动所有发送任务，不等待返回结果
+    for addr in targets.iter() {
+        let tx_bytes_clone = tx_bytes.clone();
+        let socket = state.udp_socket.clone();
+        let addr_clone = *addr;
+        let sig_clone = signature;
+
+        // 在后台并行发送，不等待结果
+        tokio::spawn(async move {
+            match socket.send_to(&tx_bytes_clone, addr_clone).await {
+                Ok(_) => {
+                    tracing::debug!(
+                        "[TPU] Sent transaction to {}:{}, signature: {}",
+                        addr_clone.ip(),
+                        addr_clone.port(),
+                        sig_clone
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "[TPU] Failed to send to {}:{}, signature: {}, error: {}",
+                        addr_clone.ip(),
+                        addr_clone.port(),
+                        sig_clone,
+                        e
+                    );
+                }
+            }
+        });
+    }
+}
+
 async fn handle_proxy_request(
     State(state): State<AppState>,
+    Query(query): Query<TokenQuery>,
     headers: HeaderMap,
     body: String,
 ) -> Result<Json<JSONRPCResponse>, StatusCode> {
+    // 验证 token
+    match query.token.as_deref() {
+        Some(token) if token == VALID_TOKEN => {
+            tracing::debug!("[AUTH] Valid token provided");
+        }
+        _ => {
+            warn!("[AUTH] Invalid or missing token");
+            return Ok(Json(JSONRPCResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::Value::Null,
+                result: None,
+                error: Some(RPCError {
+                    code: -32001,
+                    message: "Unauthorized".to_string(),
+                    data: Some("Invalid or missing token.".to_string()),
+                }),
+            }));
+        }
+    }
+
     // 解析 JSON-RPC 请求
     let req: JSONRPCRequest = match serde_json::from_str(&body) {
         Ok(req) => req,
@@ -382,32 +734,57 @@ async fn handle_proxy_request(
         }
     };
 
-    // 检查方法名是否允许
-    if !ALLOWED_METHODS.contains(&req.method.as_str()) {
-        warn!("[BLOCKED] Method: {} - not allowed", req.method);
-        return Ok(Json(JSONRPCResponse {
-            jsonrpc: "2.0".to_string(),
-            id: req.id,
-            result: None,
-            error: Some(RPCError {
-                code: -32601,
-                message: format!(
-                    "Method not allowed: {}. Allowed methods: sendTransaction, simulateTransaction, getLatestBlockhash",
-                    req.method
-                ),
-                data: None,
-            }),
-        }));
-    }
-
     tracing::debug!("[ALLOWED] Method: {}, ID: {}", req.method, req.id);
 
     // 根据方法类型处理
     let response = match req.method.as_str() {
-        "sendTransaction" => handle_send_transaction_tpu(state.clone(), req).await,
+        "sendTransaction" => {
+            // 并行执行 HTTP 代理和 UDP 发送
+            let state_clone = state.clone();
+            let req_clone = req.clone();
+
+            // 启动 UDP 发送任务（fire-and-forget）
+            tokio::spawn(async move {
+                // 解析交易以获取签名和字节
+                if let Some(serde_json::Value::String(tx_str)) = req_clone.params.get(0) {
+                    // 尝试解码交易
+                    let tx_bytes: Option<Vec<u8>> =
+                        if tx_str.contains('/') || tx_str.contains('+') || tx_str.contains('=') {
+                            // 看起来像 base64
+                            base64::engine::general_purpose::STANDARD
+                                .decode(tx_str)
+                                .ok()
+                                .or_else(|| bs58::decode(tx_str).into_vec().ok())
+                        } else {
+                            // 看起来像 base58
+                            bs58::decode(tx_str).into_vec().ok().or_else(|| {
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(tx_str)
+                                    .ok()
+                            })
+                        };
+
+                    if let Some(tx_bytes) = tx_bytes {
+                        // 尝试提取签名
+                        if let Ok(versioned_tx) =
+                            bincode::deserialize::<VersionedTransaction>(&tx_bytes)
+                        {
+                            let signature = versioned_tx.signatures[0];
+                            send_transaction_via_tpu(state_clone, tx_bytes, signature).await;
+                        } else if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                            let signature = tx.signatures[0];
+                            send_transaction_via_tpu(state_clone, tx_bytes, signature).await;
+                        }
+                    }
+                }
+            });
+
+            // 并行执行 HTTP 代理，并返回其响应
+            handle_proxy_method(state, req, headers, body).await
+        }
         _ => {
             // 其他方法通过 HTTP 代理
-            handle_proxy_method(state.clone(), req, headers, body).await
+            handle_proxy_method(state, req, headers, body).await
         }
     };
 
@@ -427,6 +804,265 @@ async fn handle_proxy_request(
             }))
         }
     }
+}
+
+async fn handle_jito_transactions(
+    State(state): State<AppState>,
+    Query(query): Query<TokenQuery>,
+    body: String,
+) -> Result<Json<JSONRPCResponse>, StatusCode> {
+    // 验证 token
+    match query.token.as_deref() {
+        Some(token) if token == VALID_TOKEN => {
+            tracing::debug!("[JITO-AUTH] Valid token provided");
+        }
+        _ => {
+            warn!("[JITO-AUTH] Invalid or missing token");
+            return Ok(Json(JSONRPCResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::Value::Null,
+                result: None,
+                error: Some(RPCError {
+                    code: -32001,
+                    message: "Unauthorized".to_string(),
+                    data: Some(
+                        "Invalid or missing token. Please provide ?token=beyond0128".to_string(),
+                    ),
+                }),
+            }));
+        }
+    }
+
+    // 解析 JSON-RPC 请求
+    let req: JSONRPCRequest = match serde_json::from_str(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            error!("[JITO-TPU] Failed to parse JSON: {}", e);
+            return Ok(Json(JSONRPCResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::Value::Null,
+                result: None,
+                error: Some(RPCError {
+                    code: -32700,
+                    message: "Parse error".to_string(),
+                    data: Some(e.to_string()),
+                }),
+            }));
+        }
+    };
+
+    // 解析参数（和 sendTransaction 一致）
+    if req.params.is_empty() {
+        return Ok(Json(JSONRPCResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: None,
+            error: Some(RPCError {
+                code: -32602,
+                message: "Invalid params".to_string(),
+                data: Some("Missing transaction parameter".to_string()),
+            }),
+        }));
+    }
+
+    // 获取交易数据（可能是 base58 或 base64 编码的字符串）
+    let tx_str = match req.params[0].as_str() {
+        Some(s) => s,
+        None => {
+            return Ok(Json(JSONRPCResponse {
+                jsonrpc: "2.0".to_string(),
+                id: req.id,
+                result: None,
+                error: Some(RPCError {
+                    code: -32602,
+                    message: "Invalid params".to_string(),
+                    data: Some("Transaction must be a string (base58 or base64)".to_string()),
+                }),
+            }));
+        }
+    };
+
+    // 尝试解码交易（支持 base58 和 base64）
+    let tx_bytes = if tx_str.contains('/') || tx_str.contains('+') || tx_str.contains('=') {
+        // 看起来像 base64，尝试 base64 解码
+        match base64::engine::general_purpose::STANDARD.decode(tx_str) {
+            Ok(bytes) => {
+                tracing::debug!("[JITO-TPU] Decoded transaction as base64");
+                bytes
+            }
+            Err(e) => {
+                // base64 解码失败，尝试 base58
+                match bs58::decode(tx_str).into_vec() {
+                    Ok(bytes) => {
+                        tracing::debug!(
+                            "[JITO-TPU] Decoded transaction as base58 (after base64 failed)"
+                        );
+                        bytes
+                    }
+                    Err(e2) => {
+                        return Ok(Json(JSONRPCResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: req.id,
+                            result: None,
+                            error: Some(RPCError {
+                                code: -32602,
+                                message: "Invalid params".to_string(),
+                                data: Some(format!("Failed to decode transaction (tried base64 and base58): base64 error: {}, base58 error: {}", e, e2)),
+                            }),
+                        }));
+                    }
+                }
+            }
+        }
+    } else {
+        // 看起来像 base58，先尝试 base58
+        match bs58::decode(tx_str).into_vec() {
+            Ok(bytes) => {
+                tracing::debug!("[JITO-TPU] Decoded transaction as base58");
+                bytes
+            }
+            Err(_) => {
+                // base58 失败，尝试 base64
+                match base64::engine::general_purpose::STANDARD.decode(tx_str) {
+                    Ok(bytes) => {
+                        tracing::debug!(
+                            "[JITO-TPU] Decoded transaction as base64 (after base58 failed)"
+                        );
+                        bytes
+                    }
+                    Err(e) => {
+                        return Ok(Json(JSONRPCResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: req.id,
+                            result: None,
+                            error: Some(RPCError {
+                                code: -32602,
+                                message: "Invalid params".to_string(),
+                                data: Some(format!(
+                                    "Failed to decode transaction (tried base58 and base64): {}",
+                                    e
+                                )),
+                            }),
+                        }));
+                    }
+                }
+            }
+        }
+    };
+
+    // 尝试反序列化交易以获取签名
+    let signature = match bincode::deserialize::<VersionedTransaction>(&tx_bytes) {
+        Ok(versioned_tx) => versioned_tx.signatures[0],
+        Err(_) => {
+            // 尝试旧的 Transaction 格式
+            match bincode::deserialize::<Transaction>(&tx_bytes) {
+                Ok(tx) => tx.signatures[0],
+                Err(e) => {
+                    return Ok(Json(JSONRPCResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: req.id,
+                        result: None,
+                        error: Some(RPCError {
+                            code: -32602,
+                            message: "Invalid params".to_string(),
+                            data: Some(format!("Failed to deserialize transaction: {}", e)),
+                        }),
+                    }));
+                }
+            }
+        }
+    };
+
+    let start = std::time::Instant::now();
+
+    // 获取 Jito leader TPU 地址
+    let jito_guard = state.jito_tpu_addresses.read().await;
+    let should_use_jito_tpu = !jito_guard.is_empty();
+    let targets: Vec<SocketAddr> = if should_use_jito_tpu {
+        jito_guard.iter().copied().collect()
+    } else {
+        Vec::new()
+    };
+    drop(jito_guard);
+
+    if should_use_jito_tpu && !targets.is_empty() {
+        tracing::debug!(
+            "[JITO-TPU] Sending transaction via TPU UDP to {} Jito leader nodes",
+            targets.len()
+        );
+
+        // 记录 TPU 发送开始时间
+        let tpu_send_start = std::time::Instant::now();
+
+        // 并发发送到多个 Jito leader TPU 地址
+        let mut send_tasks = Vec::new();
+        for addr in targets.iter() {
+            let tx_bytes_clone = tx_bytes.clone();
+            let socket = state.udp_socket.clone();
+            let addr_clone = *addr;
+
+            send_tasks.push(tokio::spawn(async move {
+                match socket.send_to(&tx_bytes_clone, addr_clone).await {
+                    Ok(_) => {
+                        tracing::debug!(
+                            "[JITO-TPU] Sent transaction to {}:{}",
+                            addr_clone.ip(),
+                            addr_clone.port()
+                        );
+                        Ok(addr_clone)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "[JITO-TPU] Failed to send to {}:{}: {}",
+                            addr_clone.ip(),
+                            addr_clone.port(),
+                            e
+                        );
+                        Err(e)
+                    }
+                }
+            }));
+        }
+
+        // 等待所有发送任务完成
+        let mut sent_count = 0;
+        for task in send_tasks {
+            if let Ok(Ok(_)) = task.await {
+                sent_count += 1;
+            }
+        }
+
+        let tpu_send_duration = tpu_send_start.elapsed();
+        let total_duration = start.elapsed();
+
+        if sent_count > 0 {
+            info!(
+                "[JITO-TPU] Transaction sent via TPU UDP to {} Jito leader nodes, signature: {}, tpu_send_duration: {:?}, total_duration: {:?}",
+                sent_count, signature, tpu_send_duration, total_duration
+            );
+
+            // TPU 发送是异步的，直接返回签名
+            return Ok(Json(JSONRPCResponse {
+                jsonrpc: "2.0".to_string(),
+                id: req.id,
+                result: Some(serde_json::Value::String(signature.to_string())),
+                error: None,
+            }));
+        }
+    }
+
+    // 如果 Jito TPU 不可用，返回错误
+    warn!("[JITO-TPU] Jito TPU client not available, cannot send transaction");
+    Ok(Json(JSONRPCResponse {
+        jsonrpc: "2.0".to_string(),
+        id: req.id,
+        result: None,
+        error: Some(RPCError {
+            code: -32603,
+            message: "Jito TPU not available".to_string(),
+            data: Some("Jito leader TPU addresses not initialized or unavailable".to_string()),
+        }),
+    }))
 }
 
 async fn handle_send_transaction_tpu(
@@ -578,7 +1214,7 @@ async fn handle_send_transaction_tpu(
 
     let start = std::time::Instant::now();
 
-    // 尝试通过 TPU UDP 直接发送
+    // 直接通过 TPU UDP 发送，不进行任何 preflight 检查
     let tpu_guard = state.tpu_addresses.read().await;
     let should_use_tpu = !tpu_guard.is_empty();
     let targets: Vec<SocketAddr> = if should_use_tpu {
@@ -589,153 +1225,55 @@ async fn handle_send_transaction_tpu(
     drop(tpu_guard); // 尽早释放锁
 
     if should_use_tpu && !targets.is_empty() {
-        tracing::debug!(
-            "[TPU] Preflight check before sending via TPU UDP (using processed commitment)"
-        );
+        tracing::debug!("[TPU] Sending transaction via TPU UDP directly to leader (no preflight, fire-and-forget)");
 
-        // 先进行 preflight 校验（模拟交易执行），使用 processed commitment level
-        let preflight_start = std::time::Instant::now();
-        let mut sim_config = RpcSimulateTransactionConfig::default();
-        sim_config.commitment = Some(CommitmentConfig::processed());
-        sim_config.sig_verify = false; // 不验证签名（更快）
-
-        // 根据交易类型进行模拟
-        let simulation_result = match &transaction_type {
-            TransactionType::Versioned(ref vtx) => {
-                state
-                    .rpc_client
-                    .simulate_transaction_with_config(vtx, sim_config)
-                    .await
-            }
-            TransactionType::Legacy(ref tx) => {
-                state
-                    .rpc_client
-                    .simulate_transaction_with_config(tx, sim_config)
-                    .await
-            }
-        };
-        let preflight_duration = preflight_start.elapsed();
-
-        match simulation_result {
-            Ok(sim_response) => {
-                // 检查模拟结果是否有错误
-                if let Some(err) = sim_response.value.err {
-                    // 交易模拟失败，直接返回错误
-                    warn!(
-                        "[TPU] Transaction simulation failed: {:?}, signature: {}",
-                        err, signature
-                    );
-                    return Ok(JSONRPCResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: req.id,
-                        result: None,
-                        error: Some(RPCError {
-                            code: -32603,
-                            message: "Transaction simulation failed".to_string(),
-                            data: Some(format!("{:?}", err)),
-                        }),
-                    });
-                }
-                // Preflight 通过，继续 TPU 发送
-                info!(
-                    "[TPU] Preflight check passed, duration: {:?}, signature: {}",
-                    preflight_duration, signature
-                );
-            }
-            Err(e) => {
-                // Preflight 校验失败，返回错误
-                // 这可能是网络问题、RPC 节点问题或配置问题
-                // 为了安全，不继续发送未经验证的交易
-                error!(
-                    "[TPU] Preflight check failed (simulation error): {}, signature: {}",
-                    e, signature
-                );
-                return Ok(JSONRPCResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(RPCError {
-                        code: -32603,
-                        message: "Preflight check failed".to_string(),
-                        data: Some(format!(
-                            "Failed to simulate transaction: {}. This may be due to network issues, RPC node unavailability, or configuration problems.",
-                            e
-                        )),
-                    }),
-                });
-            }
-        }
-
-        tracing::debug!("[TPU] Sending transaction via TPU UDP directly to leader");
-
-        // 记录 TPU 发送开始时间
         let tpu_send_start = std::time::Instant::now();
 
-        // 序列化交易（根据类型使用原始字节或重新序列化）
-        // 注意：对于 TPU 发送，我们使用原始字节，因为已经反序列化过了
-        // 这样可以保持原始格式，避免序列化/反序列化过程中的问题
-        let tx_bytes_for_tpu = match &transaction_type {
-            TransactionType::Versioned(_) | TransactionType::Legacy(_) => {
-                // 使用原始字节，因为 TPU 需要的是 bincode 序列化的格式
-                tx_bytes.clone()
-            }
-        };
-
-        // 并发发送到多个 TPU 地址（当前 leader 和下一个 leader）
-        let mut send_tasks = Vec::new();
+        // 并行启动所有发送任务，不等待返回结果
         for addr in targets.iter() {
-            let tx_bytes_clone = tx_bytes_for_tpu.clone();
+            let tx_bytes_clone = tx_bytes.clone();
             let socket = state.udp_socket.clone();
             let addr_clone = *addr;
+            let sig_clone = signature;
 
-            send_tasks.push(tokio::spawn(async move {
+            // 在后台并行发送，不等待结果
+            tokio::spawn(async move {
                 match socket.send_to(&tx_bytes_clone, addr_clone).await {
                     Ok(_) => {
                         tracing::debug!(
-                            "[TPU] Sent transaction to {}:{}",
+                            "[TPU] Sent transaction to {}:{}, signature: {}",
                             addr_clone.ip(),
-                            addr_clone.port()
+                            addr_clone.port(),
+                            sig_clone
                         );
-                        Ok(addr_clone)
                     }
                     Err(e) => {
                         tracing::debug!(
-                            "[TPU] Failed to send to {}:{}: {}",
+                            "[TPU] Failed to send to {}:{}, signature: {}, error: {}",
                             addr_clone.ip(),
                             addr_clone.port(),
+                            sig_clone,
                             e
                         );
-                        Err(e)
                     }
                 }
-            }));
-        }
-
-        // 等待所有发送任务完成
-        let mut sent_count = 0;
-        for task in send_tasks {
-            if let Ok(Ok(_)) = task.await {
-                sent_count += 1;
-            }
+            });
         }
 
         let tpu_send_duration = tpu_send_start.elapsed();
         let total_duration = start.elapsed();
-        if sent_count > 0 {
-            info!(
-                "[TPU] Transaction sent via TPU UDP to {} addresses, signature: {}, preflight_duration: {:?}, tpu_send_duration: {:?}, total_duration: {:?}",
-                sent_count, signature, preflight_duration, tpu_send_duration, total_duration
-            );
+        info!(
+            "[TPU] Transaction sent via TPU UDP to {} addresses (fire-and-forget), signature: {}, tpu_send_duration: {:?}, total_duration: {:?}",
+            targets.len(), signature, tpu_send_duration, total_duration
+        );
 
-            // TPU 发送是异步的，直接返回签名
-            // 注意：TPU 发送不等待确认，但通常比 RPC 更快
-            return Ok(JSONRPCResponse {
-                jsonrpc: "2.0".to_string(),
-                id: req.id,
-                result: Some(serde_json::Value::String(signature.to_string())),
-                error: None,
-            });
-        }
+        // 立即返回，不等待发送结果
+        return Ok(JSONRPCResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: Some(serde_json::Value::String(signature.to_string())),
+            error: None,
+        });
     }
 
     // 如果 TPU 客户端未初始化，回退到 RPC 方式
