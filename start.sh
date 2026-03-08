@@ -154,11 +154,12 @@ start_service() {
 }
 
 # 重启服务
+# 可选: restart_service [--no-log|--quiet] 关闭日志输出
 restart_service() {
     build_project
     stop_service
     sleep 1
-    start_service
+    start_service "$1"
 }
 
 # 主逻辑
@@ -167,7 +168,7 @@ case "${1:-start}" in
         stop_service
         ;;
     restart)
-        restart_service
+        restart_service "$2"
         ;;
     status)
         show_status
@@ -187,6 +188,8 @@ case "${1:-start}" in
         echo "  start --quiet   - 同上，关闭日志输出"
         echo "  stop         - 停止服务"
         echo "  restart      - 重启服务"
+        echo "  restart --no-log   - 重启并关闭日志输出"
+        echo "  restart --quiet   - 同上"
         echo "  status       - 查看运行状态"
         echo "  build        - 编译项目（release 模式）"
         exit 1
