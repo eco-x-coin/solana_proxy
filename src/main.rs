@@ -84,8 +84,8 @@ const VALID_TOKEN: &str = "beyond0128";
 // TPU 端口常量
 const TPU_PORT: u16 = 8004;
 
-// TPU 地址更新间隔（秒）
-const TPU_REFRESH_INTERVAL_SECS: u64 = 1;
+// TPU 地址更新间隔（毫秒，100ms 更新一次 leader）
+const TPU_REFRESH_INTERVAL_MS: u64 = 100;
 
 // 最大 TPU 地址数量（发送到前 N 个 leader）
 const MAX_TPU_TARGETS: usize = 10;
@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
 
         // 定期更新 TPU 地址
         // Leader 节点会定期轮换，需要保持地址列表最新
-        let mut interval = tokio::time::interval(Duration::from_secs(TPU_REFRESH_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(Duration::from_millis(TPU_REFRESH_INTERVAL_MS));
         // 跳过第一次立即触发（因为上面已经初始化过了）
         interval.tick().await;
 
@@ -232,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // 定期更新 Jito TPU 地址
-        let mut interval = tokio::time::interval(Duration::from_secs(TPU_REFRESH_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(Duration::from_millis(TPU_REFRESH_INTERVAL_MS));
         interval.tick().await;
 
         loop {
