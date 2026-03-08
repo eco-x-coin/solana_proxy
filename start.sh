@@ -87,7 +87,13 @@ build_project() {
 }
 
 # 启动服务
+# 可选: start_service [--no-log|--quiet] 关闭日志输出（stdout/stderr 重定向到 /dev/null）
 start_service() {
+    local NO_LOG=false
+    if [ "$1" = "--no-log" ] || [ "$1" = "--quiet" ]; then
+        NO_LOG=true
+    fi
+
     # 检查是否已在运行
     if check_running; then
         PID=$(cat "$PID_FILE")
@@ -108,8 +114,12 @@ start_service() {
     echo -e "${YELLOW}正在启动 $BINARY_NAME...${NC}"
     cd "$SCRIPT_DIR" || exit 1
     
-    # 使用 nohup 后台运行，输出到日志文件
-    nohup "$BINARY_PATH" > "$LOG_FILE" 2>&1 &
+    # 使用 nohup 后台运行，输出到日志文件或丢弃
+    if [ "$NO_LOG" = true ]; then
+        nohup "$BINARY_PATH" > /dev/null 2>&1 &
+    else
+        nohup "$BINARY_PATH" > "$LOG_FILE" 2>&1 &
+    fi
     PID=$!
     
     # 保存 PID
@@ -119,10 +129,14 @@ start_service() {
     sleep 2
     if ps -p "$PID" > /dev/null 2>&1; then
         echo -e "${GREEN}$BINARY_NAME 启动成功 (PID: $PID)${NC}"
-        echo "日志文件: $LOG_FILE"
+        if [ "$NO_LOG" = true ]; then
+            echo "日志输出: 已关闭"
+        else
+            echo "日志文件: $LOG_FILE"
+            echo "使用 'tail -f $LOG_FILE' 查看实时日志"
+        fi
         echo "使用 './start.sh stop' 停止服务"
         echo "使用 './start.sh status' 查看状态"
-        echo "使用 'tail -f $LOG_FILE' 查看实时日志"
     else
         echo -e "${RED}$BINARY_NAME 启动失败${NC}"
         rm -f "$PID_FILE"
@@ -158,15 +172,23 @@ case "${1:-start}" in
     status)
         show_status
         ;;
+    start)
+        start_service "$2"
+        ;;
+    build)
+        build_project
+        ;;
     *)
-        echo "使用方法: $0 [start|stop|restart|status|build]"
+        echo "使用方法: $0 [start|stop|restart|status|build] [选项]"
         echo ""
         echo "命令说明:"
-        echo "  start   - 启动服务（默认）"
-        echo "  stop    - 停止服务"
-        echo "  restart - 重启服务"
-        echo "  status  - 查看运行状态"
-        echo "  build   - 编译项目（release 模式）"
+        echo "  start        - 启动服务（默认）"
+        echo "  start --no-log   - 启动服务并关闭日志输出（不写日志文件）"
+        echo "  start --quiet   - 同上，关闭日志输出"
+        echo "  stop         - 停止服务"
+        echo "  restart      - 重启服务"
+        echo "  status       - 查看运行状态"
+        echo "  build        - 编译项目（release 模式）"
         exit 1
         ;;
 esac
